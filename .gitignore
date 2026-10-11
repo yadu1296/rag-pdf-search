@@ -1,0 +1,34 @@
+# Build output
+target/
+build/
+out/
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.project
+.classpath
+.settings/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local env / secrets
+.env
+.env.local
+*.local
+
+# Logs
+*.log
+logs/
+
+# Spring Boot
+*.pid
+HELP.md
+
+# Transformers / ONNX model cache (downloaded at runtime)
+.transformers-cache/
