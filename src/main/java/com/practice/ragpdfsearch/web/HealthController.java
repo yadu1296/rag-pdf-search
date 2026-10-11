@@ -12,7 +12,7 @@ public class HealthController {
     public Map<String, Object> health() {
         return Map.of(
                 "status", "UP",
-                "service", "rag-pdf-search"
+                "service", "RAG Search"
         );
     }
 }

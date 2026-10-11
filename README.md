@@ -1,6 +1,8 @@
-# rag-pdf-search
+# RAG Search
 
 End-to-end Retrieval-Augmented Generation (RAG) over PDFs — ask questions and get answers grounded in the document content.
+
+> Technical artifact / repo name: `rag-pdf-search`. User-facing label: **RAG Search**.
 
 ## Stack
 
@@ -10,6 +12,7 @@ End-to-end Retrieval-Augmented Generation (RAG) over PDFs — ask questions and 
 - **Ollama** (fully local, no API keys)
   - `llama3.1:8b` — chat / answering
   - `nomic-embed-text` — embeddings (768-dim)
+- **Spring AI JDBC chat memory** — persistent multi-turn conversation history in Postgres
 - **Flyway** — schema migrations
 - **Apache PDFBox** (via `spring-ai-pdf-document-reader`)
 
@@ -88,10 +91,16 @@ Server-side flow on every upload:
 
 ### `GET /api/ask` — ask a question
 
-Query params: `q` (required), `topK` (default `4`).
+Query params:
+
+| Param | Required | Default | Meaning |
+|---|---|---|---|
+| `q` | yes | — | The question |
+| `topK` | no | `4` | How many chunks to retrieve |
+| `conversationId` | no | `default` | Thread ID for multi-turn memory. Different IDs = independent conversations. |
 
 ```powershell
-curl "http://localhost:8080/api/ask?q=Where+did+I+start+my+career&topK=4"
+curl "http://localhost:8080/api/ask?q=Where+did+I+start+my+career&conversationId=session-abc"
 ```
 
 Response (shortened):
@@ -99,6 +108,7 @@ Response (shortened):
 ```json
 {
   "question": "Where did I start my career",
+  "conversationId": "session-abc",
   "topK": 4,
   "retrievedChunks": [
     { "id": "...", "score": 0.78, "filename": "resume.pdf", "preview": "..." }
@@ -107,6 +117,73 @@ Response (shortened):
   "answer": "Wipro Technologies."
 }
 ```
+
+Follow-up question in the same conversation:
+
+```powershell
+curl "http://localhost:8080/api/ask?q=How+long+did+I+work+there&conversationId=session-abc"
+# Answer uses "there" = Wipro from the previous turn's answer.
+```
+
+### `GET /api/ask/conversations` — list all conversations
+
+Returns every known conversation ID (grouped from `SPRING_AI_CHAT_MEMORY`) with metadata — used to render the sidebar in the chat UI.
+
+```powershell
+curl "http://localhost:8080/api/ask/conversations"
+```
+
+Response:
+
+```json
+[
+  {
+    "conversationId": "a1b2c3d4-...",
+    "messageCount": 4,
+    "lastActivity": "2026-10-11T15:30:12Z",
+    "firstQuestion": "Where did I start my career?"
+  }
+]
+```
+
+Ordered by `lastActivity DESC` so the most recent conversation is first.
+
+### `GET /api/ask/conversations/{id}` — load one conversation
+
+Returns the full ordered message history (user + assistant pairs) for a conversation.
+
+```powershell
+curl "http://localhost:8080/api/ask/conversations/session-abc"
+```
+
+### `DELETE /api/ask/conversations/{id}` — clear a conversation
+
+Drops all remembered Q&A for one `conversationId`. Idempotent — unknown IDs are a no-op.
+
+```powershell
+curl -X DELETE "http://localhost:8080/api/ask/conversations/session-abc"
+# 204 No Content
+```
+
+### Conversation memory
+
+Memory is handled by Spring AI's `MessageChatMemoryAdvisor` + auto-wired in-memory `ChatMemory` (default window = last 20 messages per conversation ID). Each call to `/api/ask`:
+
+1. Looks up the last N messages for that `conversationId` from `ChatMemory`.
+2. Prepends them to the prompt before the current question (after the system prompt with retrieved chunks).
+3. Sends everything to Ollama.
+4. Appends the new (user, assistant) pair back into `ChatMemory` for next time.
+
+Properties of the current setup:
+- **Persistent (JDBC)** → conversations survive app restarts, stored in Postgres table `SPRING_AI_CHAT_MEMORY` via `spring-ai-starter-model-chat-memory-repository-jdbc`. Schema is created on first boot (idempotent `CREATE TABLE IF NOT EXISTS`).
+- **Per browser tab** → the chat UI generates a UUID on page load, so each tab is an independent thread.
+- **Last 20 messages** → older turns silently roll out of the window. Adjust via `spring.ai.chat.memory.window-size` if you need more.
+
+### Three ways to prove memory is being used
+
+1. **Server logs** — every `/api/ask` prints a `[1b] Memory has N prior message(s)` block with the prior messages that were loaded.
+2. **Response field** — every `/api/ask` response includes `"priorMessagesCount": N` showing what the advisor consulted.
+3. **GET /api/ask/conversations/{id}** — returns the live message history for a conversation. Also peek at `SELECT * FROM SPRING_AI_CHAT_MEMORY` directly in DBeaver.
 
 Watch the Spring Boot console — each call logs every RAG pipeline step:
 
@@ -122,7 +199,9 @@ Watch the Spring Boot console — each call logs every RAG pipeline step:
 ────────────── RAG PIPELINE END ──────────────
 ```
 
-## Peek at the vector store
+## Peek at Postgres
+
+**Vector store (the indexed PDF chunks):**
 
 ```sql
 SELECT count(*) FROM vector_store;
@@ -138,6 +217,31 @@ To wipe and re-ingest cleanly:
 TRUNCATE TABLE vector_store;
 ```
 
+**Chat memory (persisted conversations):**
+
+```sql
+-- leaderboard of all conversations
+SELECT conversation_id,
+       COUNT(*) AS messages,
+       MIN("timestamp") AS started,
+       MAX("timestamp") AS last_activity
+FROM SPRING_AI_CHAT_MEMORY
+GROUP BY conversation_id
+ORDER BY last_activity DESC;
+
+-- full transcript of one conversation
+SELECT type, LEFT(content, 100) AS preview, "timestamp"
+FROM SPRING_AI_CHAT_MEMORY
+WHERE conversation_id = 'session-abc'
+ORDER BY sequence_id;
+```
+
+Wipe all conversations:
+
+```sql
+TRUNCATE TABLE SPRING_AI_CHAT_MEMORY;
+```
+
 ## Browser UI
 
 A tiny static HTML page is served alongside the API. Open any of:
@@ -148,11 +252,33 @@ A tiny static HTML page is served alongside the API. Open any of:
 
 (All three resolve to the same page — the root and `/chat` are view-controller forwards configured in `WebConfig.java`.)
 
-The page gives you:
+Two-column layout: **sidebar on the left** listing every conversation ever recorded, **chat area on the right**.
 
-- A chat box that calls `/api/ask` on submit, with configurable `topK`
-- Each answer shows latency, chunk count, and an expandable "Show retrieved chunks" section (score, filename, preview) so you can see what the retriever matched
-- An **+ Upload PDF** button in the header that calls `/api/ingest` via a `FormData` fetch — ingest new PDFs without leaving the page
+Features:
+
+- **Sidebar (left)** — reads `GET /api/ask/conversations` on page load and after every message. Each entry shows the first user question (truncated), message count, and relative time (`4 msg · 5m ago`). Click an entry to load its full history into the chat area; hover shows a `×` to delete that conversation. The sidebar auto-refreshes after each ask / new / delete.
+- **Chat area (right)** — standard chat scroll. Each answer shows latency, chunk count, `priorMsgs=N`, and an expandable "Show retrieved chunks" (score, filename, preview).
+- **+ New conversation** (sidebar top) — generates a fresh conversation ID so the next question starts a brand-new thread. The short conv ID is shown in the header (`conv: a1b2c3d4…`).
+- **+ Upload PDF** (header, right) — `/api/ingest` via a `FormData` fetch, ingest without leaving the page.
+
+```
+┌────────────────────────────────────────────────────────────────────────────┐
+│ rag-pdf-search · llama3.1:8b · pgvector · conv: a1b2…     [+ Upload PDF]   │
+├────────────────────────┬───────────────────────────────────────────────────┤
+│ Conversations    (3) ↻ │                                                   │
+│ ┌────────────────────┐ │                                                   │
+│ │ + New conversation │ │                                                   │
+│ └────────────────────┘ │              [ chat scrolls here ]                │
+│                        │                                                   │
+│ My favorite color is…  │                                                   │
+│   4 msg · 5m ago    ×  │                                                   │
+│                        │                                                   │
+│ Where did I start…     │                                                   │
+│   2 msg · 1h ago    ×  │                                                   │
+│                        ├───────────────────────────────────────────────────┤
+│                        │ Ask about your PDFs...        [topK: 4]  [Send]   │
+└────────────────────────┴───────────────────────────────────────────────────┘
+```
 
 It's a single vanilla-JS file (no React, no npm, no build step). Loads instantly, works offline, served straight out of `src/main/resources/static/chat.html`.
 

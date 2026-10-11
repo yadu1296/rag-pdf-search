@@ -37,6 +37,14 @@ spring:
         index-type: hnsw
         distance-type: cosine_distance
 
+    # Chat memory: JDBC-backed in Postgres. Survives restarts.
+    # Spring AI creates its SPRING_AI_CHAT_MEMORY table on startup (CREATE TABLE IF NOT EXISTS).
+    chat:
+      memory:
+        repository:
+          jdbc:
+            initialize-schema: always
+
   servlet:
     multipart:
       max-file-size: 25MB
