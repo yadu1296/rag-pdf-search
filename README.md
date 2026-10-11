@@ -65,11 +65,24 @@ curl.exe --location "http://localhost:8080/api/ingest" `
          --form "file=@`"C:/path/to/your.pdf`""
 ```
 
-Response:
+Response (first upload):
 
 ```json
-{ "filename": "your.pdf", "chunksStored": 7 }
+{ "filename": "your.pdf", "chunksStored": 7, "previousChunksReplaced": 0 }
 ```
+
+Re-upload the same filename and existing chunks are **replaced**, not duplicated:
+
+```json
+{ "filename": "your.pdf", "chunksStored": 7, "previousChunksReplaced": 7 }
+```
+
+Server-side flow on every upload:
+
+1. `DELETE FROM vector_store WHERE metadata->>'filename' = ?` — purges prior chunks for this filename (returns the count, surfaced as `previousChunksReplaced`).
+2. Parse the PDF, split into chunks, embed, insert fresh rows.
+
+**Dedupe scope is the filename.** Rename a PDF between uploads and the old copy stays in the vector store (treated as a different document). For a content-based identity, you'd compute a hash and store it as metadata.
 
 > On PowerShell, use **`curl.exe`** (not `curl`, which is an alias for `Invoke-WebRequest` and doesn't understand `--form`). Alternative: Postman with Body → form-data → key `file`, type **File**.
 
@@ -125,6 +138,24 @@ To wipe and re-ingest cleanly:
 TRUNCATE TABLE vector_store;
 ```
 
+## Browser UI
+
+A tiny static HTML page is served alongside the API. Open any of:
+
+- `http://localhost:8080/`
+- `http://localhost:8080/chat`
+- `http://localhost:8080/chat.html`
+
+(All three resolve to the same page — the root and `/chat` are view-controller forwards configured in `WebConfig.java`.)
+
+The page gives you:
+
+- A chat box that calls `/api/ask` on submit, with configurable `topK`
+- Each answer shows latency, chunk count, and an expandable "Show retrieved chunks" section (score, filename, preview) so you can see what the retriever matched
+- An **+ Upload PDF** button in the header that calls `/api/ingest` via a `FormData` fetch — ingest new PDFs without leaving the page
+
+It's a single vanilla-JS file (no React, no npm, no build step). Loads instantly, works offline, served straight out of `src/main/resources/static/chat.html`.
+
 ## Project layout
 
 ```
@@ -139,10 +170,13 @@ rag-pdf-search/
     │   └── web/
     │       ├── HealthController.java      # GET  /health
     │       ├── IngestionController.java   # POST /api/ingest  (multipart)
-    │       └── RagController.java         # GET  /api/ask
+    │       ├── RagController.java         # GET  /api/ask
+    │       └── WebConfig.java             # forwards /, /chat → /chat.html
     └── resources/
         ├── application.yml
-        └── db/migration/V1__init.sql      # enables vector, hstore, uuid-ossp
+        ├── db/migration/V1__init.sql      # enables vector, hstore, uuid-ossp
+        └── static/
+            └── chat.html                  # vanilla-JS chat + upload UI
 ```
 
 ## Tuning knobs
@@ -153,6 +187,12 @@ rag-pdf-search/
 | `RagController` | `topK` query param | `4` | How many chunks to retrieve per question |
 | `application.yml` | `spring.ai.ollama.chat.options.temperature` | `0.2` | Lower = more focused answers; higher = more creative |
 | `application.yml` | `spring.ai.vectorstore.pgvector.dimensions` | `768` | **Must match the embedding model.** nomic-embed-text = 768, OpenAI text-embedding-3-small = 1536 |
+
+**Performance tip for large vector stores:** the re-upload DELETE scans `vector_store` by `metadata->>'filename'`. Fine for tens or hundreds of PDFs. For thousands, add a functional index:
+
+```sql
+CREATE INDEX idx_vs_filename ON vector_store ((metadata->>'filename'));
+```
 
 ## What we tried and removed (and why)
 

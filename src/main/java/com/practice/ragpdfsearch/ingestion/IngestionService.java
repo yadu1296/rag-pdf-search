@@ -7,6 +7,7 @@ import org.springframework.ai.reader.pdf.PagePdfDocumentReader;
 import org.springframework.ai.transformer.splitter.TokenTextSplitter;
 import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.core.io.Resource;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
@@ -14,8 +15,8 @@ import java.util.List;
 /**
  * Phase A of RAG: load → chunk → embed → store.
  * <p>
- * {@link VectorStore#add(List)} does the embedding + persistence in one call, using the
- * {@code EmbeddingModel} bean configured by Spring AI (Ollama + nomic-embed-text here).
+ * Re-uploading the same filename replaces the existing chunks instead of duplicating them.
+ * Dedupe scope is the filename value stored in each chunk's metadata.
  */
 @Service
 public class IngestionService {
@@ -23,12 +24,8 @@ public class IngestionService {
     private static final Logger log = LoggerFactory.getLogger(IngestionService.class);
 
     private final VectorStore vectorStore;
+    private final JdbcTemplate jdbcTemplate;
 
-    /**
-     * Smaller chunks (~400 tokens) give finer-grained retrieval. Trade-off: each chunk
-     * carries less surrounding context, so the LLM relies more on retrieving the RIGHT
-     * chunk vs. getting a lot of context in one shot. Good for short, fact-oriented PDFs.
-     */
     private final TokenTextSplitter splitter = TokenTextSplitter.builder()
             .withChunkSize(400)
             .withMinChunkSizeChars(200)
@@ -37,18 +34,22 @@ public class IngestionService {
             .withKeepSeparator(true)
             .build();
 
-    public IngestionService(VectorStore vectorStore) {
+    public IngestionService(VectorStore vectorStore, JdbcTemplate jdbcTemplate) {
         this.vectorStore = vectorStore;
+        this.jdbcTemplate = jdbcTemplate;
     }
 
-    /**
-     * Reads a PDF, splits each page into ~800-token chunks with 350-char overlap,
-     * tags each chunk with the source filename, embeds them, and stores them in pgvector.
-     *
-     * @return number of chunks stored
-     */
-    public int ingest(Resource pdf, String filename) {
+    public IngestResult ingest(Resource pdf, String filename) {
         log.info("Ingesting PDF: {}", filename);
+
+        // Drop any prior chunks for this filename so re-uploads don't accumulate duplicates.
+        // Parameterised query — safe even if a filename contains apostrophes.
+        int replaced = jdbcTemplate.update(
+                "DELETE FROM vector_store WHERE metadata->>'filename' = ?",
+                filename);
+        if (replaced > 0) {
+            log.info("Replacing {} existing chunk(s) for {}", replaced, filename);
+        }
 
         var reader = new PagePdfDocumentReader(pdf);
         List<Document> pages = reader.get();
@@ -62,6 +63,12 @@ public class IngestionService {
         vectorStore.add(chunks);
         log.info("Stored {} chunk(s) in vector store", chunks.size());
 
-        return chunks.size();
+        return new IngestResult(chunks.size(), replaced);
     }
+
+    /**
+     * @param chunksStored     number of chunks persisted on this call
+     * @param previousChunksReplaced number of existing chunks removed first; 0 means first upload
+     */
+    public record IngestResult(int chunksStored, int previousChunksReplaced) {}
 }

@@ -39,10 +39,11 @@ public class IngestionController {
             @Override public String getFilename() { return name; }
         };
 
-        int chunks = ingestionService.ingest(resource, name);
+        IngestionService.IngestResult result = ingestionService.ingest(resource, name);
         return ResponseEntity.ok(Map.of(
                 "filename", name,
-                "chunksStored", chunks
+                "chunksStored", result.chunksStored(),
+                "previousChunksReplaced", result.previousChunksReplaced()
         ));
     }
 }
